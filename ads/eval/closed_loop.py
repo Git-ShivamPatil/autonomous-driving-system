@@ -16,7 +16,9 @@ the model's own states (on-policy MAE). Their ratio is the open-loop / closed-lo
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
@@ -25,6 +27,7 @@ import numpy as np
 
 from ads import config, provenance
 from ads.eval import metrics
+from ads.keepawake import keep_awake
 
 _STATE: dict = {}
 
@@ -80,7 +83,7 @@ def _overlay(frame: np.ndarray, step: int, speed: float, driver_steer: float, ex
 def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
     import cv2
 
-    from ads.sim.env import camera_frame, lane_state, speed_kmh
+    from ads.sim.env import camera_frame, lane_state, on_solid_line, speed_kmh
     from ads.sim.expert import expert_action, make_expert
 
     path = out / "episodes" / f"{seed:04d}.json"
@@ -95,7 +98,7 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
     takeover_left, interventions = 0, 0
     lateral_abs, segments, segment = [], [], []
     open_pairs = []  # (prediction, expert steering, curvature) on the visited states
-    crash_flags = []
+    crash_flags, line_flags = [], []
     distance, steps = 0.0, 0
     writer = None
     if video:
@@ -111,8 +114,6 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
         lateral, curvature = lane_state(env.agent)
         v = speed_kmh(env.agent)
         pred = predict(model, camera_frame(obs), v) if model is not None else None
-        if pred is not None:
-            open_pairs.append((pred, expert_steer, curvature))
         driver_steer = expert_steer if driver == "expert" else pred
 
         if takeover_left > 0:
@@ -125,6 +126,10 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
         else:
             executed, in_control = driver_steer, True
 
+        # Open-loop pairs (expert driver) use every state; on-policy pairs (model driver) only the states
+        # the model itself reached, not the safety driver's recoveries.
+        if pred is not None and (in_control or driver == "expert"):
+            open_pairs.append((pred, expert_steer, curvature))
         if in_control:
             segment.append(executed)
             lateral_abs.append(abs(lateral))
@@ -147,6 +152,7 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
         steps += 1
         distance += speed_kmh(env.agent) / 3.6 * config.STEP_DT
         crash_flags.append(bool(info.get("crash_vehicle") or info.get("crash_object")))
+        line_flags.append(on_solid_line(env.agent))
         if terminated or truncated:
             break
     if segment:
@@ -163,6 +169,7 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
         out_of_road=bool(info.get("out_of_road")),
         arrive_dest=bool(info.get("arrive_dest")),
         route_completion=float(info.get("route_completion", float("nan"))),
+        line_touches=metrics.rising_edges(line_flags),
         lateral_abs_m=[round(x, 4) for x in lateral_abs],
         steering_segments=[[round(x, 5) for x in s] for s in segments],
     )
@@ -193,25 +200,47 @@ def summarize_records(records: list[dict], driver: str) -> dict:
     return summary
 
 
+def run_key(driver: str, model: Path | None) -> dict:
+    """Everything that determines an episode's result. Cached episodes are reused only under the same key."""
+    return {
+        "driver": driver,
+        "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest() if model else None,
+        "map_blocks": config.MAP_BLOCKS,
+        "block_distribution": config.BLOCK_DISTRIBUTION,
+        "traffic_density": config.TRAFFIC_DENSITY,
+        "horizon": config.EPISODE_HORIZON,
+        "takeover_lateral_m": config.TAKEOVER_LATERAL_M,
+        "takeover_seconds": config.TAKEOVER_SECONDS,
+        "camera_channel_order": config.CAMERA_CHANNEL_ORDER,
+    }
+
+
 def main(argv: list[str] | None = None) -> dict:
     p = argparse.ArgumentParser(description="Closed-loop evaluation on the test roads.")
     p.add_argument("--driver", choices=["model", "expert"], required=True)
     p.add_argument("--model", type=Path, default=None)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--workers", type=int, default=1, help="MetaDrive processes; >1 was slower on a 2-core, 8 GB machine")
     p.add_argument("--seeds", type=int, default=len(config.TEST_SEEDS), help="first N test seeds")
     p.add_argument("--videos", type=int, default=0, help="record MP4s for the first N seeds")
+    p.add_argument("--fresh", action="store_true", help="discard cached episodes in --out")
     args = p.parse_args(argv)
     if args.driver == "model" and args.model is None:
         p.error("--driver model needs --model")
 
     seeds = list(config.TEST_SEEDS)[: args.seeds]
+    key, key_path = run_key(args.driver, args.model), args.out / "run.json"
+    if args.fresh:
+        shutil.rmtree(args.out / "episodes", ignore_errors=True)
+    elif key_path.exists() and json.loads(key_path.read_text()) != key:
+        p.error(f"{args.out} holds episodes from a different driver, model or config; use --fresh or another --out")
     (args.out / "videos").mkdir(parents=True, exist_ok=True)
+    key_path.write_text(json.dumps(key, indent=1))
     camera = args.model is not None or args.videos > 0
     t_start = time.perf_counter()
     records: dict[int, dict] = {}
     initargs = (str(args.model) if args.model else None, camera)
-    with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=initargs) as pool:
+    with keep_awake(), ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=initargs) as pool:
         pending, idx = set(), 0
         while idx < len(seeds) or pending:
             while idx < len(seeds) and len(pending) < 2 * args.workers:

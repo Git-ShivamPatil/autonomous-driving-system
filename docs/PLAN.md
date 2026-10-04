@@ -49,7 +49,9 @@ recorded label is the expert's clean steering in the state actually visited. The
 labels teach the recovery; no side cameras or steering offsets are involved.
 
 Every second step is saved (0.2 s apart), frames below 2 km/h are skipped, and each seed's rows are
-written atomically so an interrupted collection resumes.
+written atomically so an interrupted collection resumes. The camera is rendered only on saved steps;
+`tools/frame_lag_check.py` checks that those frames are pixel-identical to a fully rendered run, and
+that multi-threaded rendering does not lag the physics state.
 
 ### Model and training
 
@@ -68,13 +70,20 @@ The model steers and the expert controls speed, so the metrics isolate steering.
 takes over steering for 3 s whenever the lateral offset exceeds 1.2 m; each takeover is one
 intervention. The expert also drives the same 1,000 roads as an upper-bound baseline.
 
+MetaDrive by default ends an episode as soon as the chassis touches a solid lane line. With lanes
+drawn 3.0–4.5 m wide and a 1.85 m wide car, that happens at a lateral offset of 0.54–1.29 m, before
+the 1.2 m takeover on most roads, which would hide interventions. Both collection and evaluation
+therefore turn that off: an episode leaves the road only when the vehicle centre leaves the lane
+surface, and solid-line touches are reported as their own rate.
+
 | Metric | Definition |
 |---|---|
 | Autonomy | 1 − interventions × 6 s / elapsed time (Bojarski et al. 2016), pooled |
 | Success rate | Destination reached with no intervention, collision or road exit; Wilson 95% interval |
 | Route completion | MetaDrive's route completion at episode end, averaged |
 | Interventions / km, collisions / km | Pooled counts over pooled distance; a collision is a rising edge of the crash flag |
-| Out-of-road rate | Episodes terminated by leaving the road |
+| Out-of-road rate | Episodes terminated because the vehicle centre left the lane surface |
+| Solid-line touches / km | Rising edges of the chassis touching a solid lane line |
 | Lateral offset | Mean and 95th percentile of \|offset from lane centre\| while the model steers |
 | Steering jerk | Mean \|d²steering/dt²\| within uninterrupted model-controlled segments |
 | Open-loop MAE | Model vs expert steering on expert-driven test states, split curve / straight |

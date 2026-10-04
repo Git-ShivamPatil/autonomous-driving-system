@@ -48,8 +48,8 @@ Windows notes:
 ## Steering pipeline
 
 ```bash
-python -m ads.sim.collect --split train --target 75000 --workers 2
-python -m ads.sim.collect --split val --target 6000 --workers 2
+python -m ads.sim.collect --split train --target 75000
+python -m ads.sim.collect --split val --target 6000
 python -m ads.dataset
 python -m ads.train --out runs/steering/pilotnet
 python -m ads.eval.closed_loop --driver model --model runs/steering/pilotnet/best.pt --out runs/closed_loop/pilotnet --videos 5
@@ -71,7 +71,7 @@ ads/
   eval/metrics.py      autonomy, Wilson intervals, per-km rates, jerk, open-loop splits
   eval/closed_loop.py  closed-loop evaluation with a safety driver
 tests/                 unit tests that run without the simulator
-tools/                 render check, Windows install helper
+tools/                 render and frame-timing checks, Windows install helper
 ```
 
 ## Testing

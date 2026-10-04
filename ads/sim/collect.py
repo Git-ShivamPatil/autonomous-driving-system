@@ -1,6 +1,6 @@
 """DART data collection (Laskey et al. 2017) on the lane-keeping road suite.
 
-    python -m ads.sim.collect --split train --target 75000 --workers 2
+    python -m ads.sim.collect --split train --target 75000
 
 Executed steering = expert steering + AR(1) noise (rho 0.9; per-episode sigma drawn from DART_SIGMAS
 by the seed). The recorded label is the expert's clean steering in the state actually visited, so the
@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from ads import config, provenance
+from ads.keepawake import keep_awake
 
 _ENV = None
 
@@ -58,7 +59,7 @@ def _init_worker(split: str) -> None:
 def collect_seed(seed: int, split: str, out: Path) -> dict:
     import cv2
 
-    from ads.sim.env import camera_frame, lane_state, speed_kmh
+    from ads.sim.env import camera_frame, lane_state, set_camera_rendering, speed_kmh
     from ads.sim.expert import expert_action, make_expert
 
     final = rows_path(out, split, seed)
@@ -67,7 +68,9 @@ def collect_seed(seed: int, split: str, out: Path) -> dict:
 
     env = _ENV
     t0 = time.perf_counter()
+    set_camera_rendering(env, True)
     obs, _info = env.reset(seed=seed)
+    reset_seconds = time.perf_counter() - t0
     expert = make_expert(env, seed)
     sigma = episode_sigma(seed)
     innov = ar1_innovation_std(sigma)
@@ -86,7 +89,9 @@ def collect_seed(seed: int, split: str, out: Path) -> dict:
             frame = camera_frame(obs)
             bgr = frame if config.CAMERA_CHANNEL_ORDER == "BGR" else frame[..., ::-1]
             rel = f"{split}/frames/{seed:05d}/{step:05d}.jpg"
-            cv2.imwrite(str(out / rel), np.ascontiguousarray(bgr), [cv2.IMWRITE_JPEG_QUALITY, 95])
+            # imwrite reports failure by return value; raising keeps the seed uncommitted so resume redoes it.
+            if not cv2.imwrite(str(out / rel), np.ascontiguousarray(bgr), [cv2.IMWRITE_JPEG_QUALITY, 95]):
+                raise OSError(f"failed to write {out / rel}")
             rows.append(
                 {
                     "path": rel,
@@ -101,6 +106,8 @@ def collect_seed(seed: int, split: str, out: Path) -> dict:
                     "noise_sigma": sigma,
                 }
             )
+        # Only frames of saved steps are rendered; the others would be discarded anyway.
+        set_camera_rendering(env, (step + 1) % config.SAVE_EVERY == 0)
         obs, _r, terminated, truncated, info = env.step([executed, accel])
         if terminated or truncated:
             end = next(
@@ -115,7 +122,15 @@ def collect_seed(seed: int, split: str, out: Path) -> dict:
         w.writeheader()
         w.writerows(rows)
     os.replace(tmp, final)
-    return {"seed": seed, "frames": len(rows), "steps": step + 1, "end": end, "sigma": sigma, "seconds": time.perf_counter() - t0}
+    return {
+        "seed": seed,
+        "frames": len(rows),
+        "steps": step + 1,
+        "end": end,
+        "sigma": sigma,
+        "seconds": time.perf_counter() - t0,
+        "reset_seconds": reset_seconds,
+    }
 
 
 def _worker_collect(seed: int, split: str, out: str) -> dict:
@@ -139,10 +154,15 @@ def main(argv: list[str] | None = None) -> dict:
     p = argparse.ArgumentParser(description="DART data collection.")
     p.add_argument("--split", choices=["train", "val"], required=True)
     p.add_argument("--target", type=int, required=True, help="frames to collect")
-    p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--workers", type=int, default=1, help="MetaDrive processes; >1 was slower on a 2-core, 8 GB machine")
     p.add_argument("--out", type=Path, default=config.DATA_DIR / "metadrive")
     p.add_argument("--max-seeds", type=int, default=None, help="stop after this many seeds (timing runs)")
     args = p.parse_args(argv)
+    with keep_awake():
+        return _run(args)
+
+
+def _run(args: argparse.Namespace) -> dict:
 
     seed_range = config.SPLITS[args.split]
     seeds = list(seed_range)[: args.max_seeds] if args.max_seeds else list(seed_range)
@@ -201,6 +221,13 @@ def main(argv: list[str] | None = None) -> dict:
         "wall_seconds": time.perf_counter() - t_start,
         "workers": args.workers,
     }
+    fresh = [done[s] for s in chosen if not done[s].get("resumed")]
+    if fresh:
+        manifest["new_seeds"] = len(fresh)
+        manifest["mean_reset_seconds"] = sum(r["reset_seconds"] for r in fresh) / len(fresh)
+        manifest["mean_steps_per_episode"] = sum(r["steps"] for r in fresh) / len(fresh)
+        manifest["mean_frames_per_episode"] = sum(r["frames"] for r in fresh) / len(fresh)
+        manifest["stepping_steps_per_s"] = sum(r["steps"] for r in fresh) / sum(r["seconds"] - r["reset_seconds"] for r in fresh)
     (args.out / f"{args.split}_manifest.json").write_text(json.dumps(manifest, indent=1))
     print(json.dumps(manifest, indent=1))
     return manifest
