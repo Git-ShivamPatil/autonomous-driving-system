@@ -42,6 +42,10 @@ def env_config(split: str, camera: bool = True, eval_mode: bool = False, **overr
         physics_world_step_size=config.PHYSICS_DT,
         decision_repeat=config.DECISION_REPEAT,
         horizon=config.EPISODE_HORIZON,
+        # MetaDrive's default ends the episode as soon as the chassis touches a solid line, which on most
+        # random lane widths happens before |lateral| reaches the 1.2 m takeover threshold. With it off,
+        # out_of_road means the vehicle centre has left the lane surface; line touches are counted instead.
+        on_continuous_line_done=False,
         use_render=False,
         log_level=50,
     )
@@ -87,3 +91,20 @@ def lane_state(agent) -> tuple[float, float]:
 
 def speed_kmh(agent) -> float:
     return float(agent.speed_km_h)
+
+
+def set_camera_rendering(env, active: bool) -> None:
+    """Render the camera on the next engine step, or skip it.
+
+    A skipped step's observation holds the previous frame. Data collection saves every SAVE_EVERY-th
+    step, so it renders only those; tools/frame_lag_check.py --every verifies the saved frames are
+    identical to fully rendered ones.
+    """
+    if env.engine is None:  # MetaDrive starts its engine on the first reset, with the camera active
+        return
+    env.engine.get_sensor("rgb_camera").buffer.setActive(active)
+
+
+def on_solid_line(agent) -> bool:
+    """Whether the chassis is touching a solid (white or yellow) lane line."""
+    return bool(agent.on_white_continuous_line or agent.on_yellow_continuous_line)

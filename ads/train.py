@@ -84,6 +84,8 @@ def main(argv: list[str] | None = None) -> dict:
         loader_kw["persistent_workers"] = True
     train_loader = DataLoader(train_set, batch_size=args.batch, shuffle=True, drop_last=True, **loader_kw)
     val_loader = DataLoader(val_set, batch_size=512, shuffle=False, **loader_kw)
+    if len(train_loader) == 0:
+        raise SystemExit(f"{len(train_set)} training frames < --batch {args.batch}: no training batches")
 
     model = PilotNet().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

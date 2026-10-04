@@ -91,6 +91,13 @@ def test_success_requires_clean_arrival():
     assert not _episode(arrive_dest=False).success
 
 
+def test_line_touches_are_reported_per_km_and_do_not_fail_an_episode():
+    eps = [_episode(line_touches=3), _episode(seed=1)]
+    s = m.summarize(eps, dt=0.1)
+    assert s["line_touches_per_km"] == pytest.approx(1.5)
+    assert s["successes"] == 2
+
+
 def test_summarize_pools_episodes():
     eps = [_episode(seed=0), _episode(seed=1, interventions=2, arrive_dest=False, route_completion=0.5)]
     s = m.summarize(eps, dt=0.1)

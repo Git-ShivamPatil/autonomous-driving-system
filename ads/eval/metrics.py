@@ -114,6 +114,7 @@ class EpisodeResult:
     out_of_road: bool
     arrive_dest: bool
     route_completion: float
+    line_touches: int = 0  # chassis touching a solid lane line, counted as rising edges
     lateral_abs_m: list[float] = field(default_factory=list)  # every step the model was steering
     steering_segments: list[list[float]] = field(default_factory=list)  # model steering, split at takeovers
 
@@ -149,6 +150,7 @@ def summarize(episodes: Sequence[EpisodeResult], dt: float, penalty_s: float = 6
         "collisions": collisions,
         "collisions_per_km": per_km(collisions, distance),
         "out_of_road_rate": sum(e.out_of_road for e in episodes) / n,
+        "line_touches_per_km": per_km(sum(e.line_touches for e in episodes), distance),
         "lateral_abs_mean_m": lat_mean,
         "lateral_abs_p95_m": lat_p95,
         "steering_jerk": steering_jerk((s for e in episodes for s in e.steering_segments), dt),
