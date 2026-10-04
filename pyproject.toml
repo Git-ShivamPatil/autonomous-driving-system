@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ads"
+version = "0.1.0"
+description = "Camera-only lane keeping in MetaDrive, multi-task YOLO11 perception on BDD100K, and TensorFlow Lite export."
+requires-python = ">=3.11,<3.12"
+license = { text = "AGPL-3.0-only" }
+dependencies = ["numpy", "opencv-python", "torch"]
+
+[project.optional-dependencies]
+sim = ["metadrive-simulator==0.4.3"]
+yolo = ["ultralytics"]
+tf = ["tensorflow"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["ads*"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
