@@ -84,7 +84,7 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
     import cv2
 
     from ads.sim.env import camera_frame, lane_state, on_solid_line, speed_kmh
-    from ads.sim.expert import expert_action, make_expert
+    from ads.sim.expert import expert_action, make_expert, reset_integral
 
     path = out / "episodes" / f"{seed:04d}.json"
     if path.exists():
@@ -112,6 +112,8 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
         )
 
     for step in range(config.EPISODE_HORIZON):
+        if driver == "model" and takeover_left == 0:
+            reset_integral(expert)  # the model is steering: no wind-up from its history (see reset_integral)
         expert_steer, accel = expert_action(expert)
         lateral, curvature = lane_state(env.agent)
         v = speed_kmh(env.agent)
@@ -227,6 +229,7 @@ def run_key(driver: str, model: Path | None, split: str = "test") -> dict:
         "takeover_lateral_m": config.TAKEOVER_LATERAL_M,
         "takeover_seconds": config.TAKEOVER_SECONDS,
         "camera_channel_order": config.CAMERA_CHANNEL_ORDER,
+        "expert_integral_reset_while_model_steers": True,
     }
 
 
