@@ -91,14 +91,50 @@ surface, and solid-line touches are reported as their own rate.
 
 ## Perception
 
-* Detection classes: BDD100K's 10 classes with `traffic light` split into red, yellow and green by
-  BDD's colour attribute (12 classes).
-* Architecture: a shared YOLO11 backbone and neck feeding a detection head and two segmentation
-  heads (drivable area, lane lines), in the style of A-YOLOM and YOLOPv2.
-* Metrics: detection mAP@0.5 and mAP@0.5:0.95, drivable-area mIoU, lane IoU and accuracy, and FPS on
-  stated hardware.
-* Baseline: perspective warp plus sliding-window lane fitting in OpenCV, scored on the same lane masks.
-* Training hardware: a free cloud GPU notebook; evaluation and FPS are reported per device.
+### Data
+
+BDD100K is downloaded from Berkeley's server: the 100k images, the per-image 2018 labels and the
+drivable-area id maps. The 2020 `det_20` detection labels are no longer available from an official
+source, so detection uses the 2018 labels, mapped to `det_20`'s class names (person → pedestrian,
+bike → bicycle, motor → motorcycle). Results are therefore not directly comparable with numbers
+reported on `det_20`.
+
+* **Detection classes (12):** pedestrian, rider, car, truck, bus, train, motorcycle, bicycle,
+  traffic light red / yellow / green, traffic sign. Traffic lights are split by their
+  `trafficLightColor` attribute. Lights labelled with no colour (seen from the side or behind, about a
+  third of all lights) have no colour class and are left out of training and evaluation targets.
+* **Drivable area:** binary, merging "direct" and "alternative" as YOLOP does.
+* **Lane lines:** BDD100K publishes no lane masks for these labels, so they are drawn from the lane
+  polylines (every category except crosswalk, direction "parallel", Bezier segments evaluated):
+  8 px wide at 1280x720 for training and 2 px for evaluation, YOLOP's protocol.
+* **Splits:** the official 70k train / 10k val split; all numbers are on val, as in YOLOP and A-YOLOM.
+
+### Model and training
+
+A shared YOLO11 backbone and neck (Ultralytics' model, unchanged) with three heads: Ultralytics'
+detection head and two light segmentation decoders. Each decoder reads the neck's stride-8 P3
+feature and the backbone's stride-4 feature, upsamples and fuses them, and predicts one logit per
+pixel. Detection uses Ultralytics' loss; each segmentation head uses BCE + Dice. COCO-pretrained
+weights initialise everything whose shape matches. Training follows Ultralytics' recipe (SGD,
+nominal batch 64, warm-up, cosine decay, weight EMA, mixed precision) at a 640x384 letterboxed
+input, with random scale, translation, flip and HSV jitter applied jointly to the image, masks and
+boxes. It runs on a free Kaggle T4 notebook, checkpointing so a run can continue across sessions.
+
+### Metrics
+
+* Detection: mAP@0.5 and mAP@0.5:0.95 over the 12 classes (Ultralytics' matching and AP code), boxes
+  mapped back to 1280x720.
+* Drivable area: IoU per class and their mean, at 1280x720.
+* Lane lines: lane IoU against the 2 px lines, plus both accuracy definitions found in the
+  literature under one name: lane recall TP/(TP+FN) (YOLOP's code) and balanced accuracy (A-YOLOM).
+* Speed: median latency and FPS of all three heads plus NMS at 640x384, with the device and
+  precision stated.
+
+### OpenCV baseline
+
+Colour and gradient thresholds, a perspective warp, sliding-window second-order fits from up to four
+histogram peaks, and the fitted curves drawn back in the image frame. Its region and thresholds are
+tuned by grid search on 2,000 training images, then it is scored on val with the same lane metrics.
 
 ## Edge export
 
