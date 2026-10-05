@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> dict:
 
 
 def _run(args: argparse.Namespace) -> dict:
-
+    stamp = provenance.stamp("ads.sim.collect")  # at the start: the code that runs is the code recorded
     seed_range = config.SPLITS[args.split]
     seeds = list(seed_range)[: args.max_seeds] if args.max_seeds else list(seed_range)
     done: dict[int, dict] = {}
@@ -211,7 +211,7 @@ def _run(args: argparse.Namespace) -> dict:
         e = done[s].get("end", "resumed")
         ends[e] = ends.get(e, 0) + 1
     manifest = {
-        "provenance": provenance.stamp("ads.sim.collect"),
+        "provenance": stamp,
         "split": args.split,
         "seeds": [chosen[0], chosen[-1]] if chosen else [],
         "num_seeds": len(chosen),
