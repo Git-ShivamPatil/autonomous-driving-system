@@ -91,6 +91,7 @@ class SteeringDataset:
         self.steering = meta["steering"]
         self.speed = meta["speed_kmh"]
         self.curvature = meta["curvature"]
+        self.noise_sigma = meta["noise_sigma"]
         self.weights = weights
         self._images: np.ndarray | None = None
         self.rng = np.random.default_rng(0)

@@ -40,9 +40,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-weights", action="store_true", help="ablation: unweighted SmoothL1")
+    p.add_argument(
+        "--sigma-max", type=float, default=None, help="ablation: only episodes with DART sigma <= this (0 = no noise injection)"
+    )
+    p.add_argument("--subsample", type=int, default=None, help="ablation: a seeded random subset of N training frames")
     p.add_argument("--limit", type=int, default=None, help="smoke test: first N frames of each split")
     p.add_argument("--cpu", action="store_true", help="force CPU even if CUDA is available")
     return p.parse_args(argv)
+
+
+def select_training_indices(
+    noise_sigma: np.ndarray, sigma_max: float | None, subsample: int | None, limit: int | None, seed: int
+) -> np.ndarray:
+    """Training frame indices after the ablation filters: DART sigma cap, then a seeded subsample, then a smoke-test limit."""
+    idx = np.arange(len(noise_sigma))
+    if sigma_max is not None:
+        idx = idx[noise_sigma[idx] <= sigma_max + 1e-9]
+    if subsample is not None and subsample < len(idx):
+        idx = np.sort(np.random.default_rng(seed).choice(idx, size=subsample, replace=False))
+    if limit is not None:
+        idx = idx[:limit]
+    return idx
 
 
 def amp_supported(device: torch.device) -> bool:
@@ -73,10 +91,11 @@ def main(argv: list[str] | None = None) -> dict:
     args.out.mkdir(parents=True, exist_ok=True)
 
     train_ds = SteeringDataset(args.train_cache, train=True)
+    train_idx = select_training_indices(train_ds.noise_sigma, args.sigma_max, args.subsample, args.limit, args.seed)
     if not args.no_weights:
-        train_ds.weights = InverseFrequencyWeights(train_ds.steering)
+        train_ds.weights = InverseFrequencyWeights(train_ds.steering[train_idx])
     val_ds = SteeringDataset(args.val_cache, train=False)
-    train_set = Subset(train_ds, range(min(args.limit, len(train_ds)))) if args.limit else train_ds
+    train_set = train_ds if len(train_idx) == len(train_ds) else Subset(train_ds, train_idx.tolist())
     val_set = Subset(val_ds, range(min(args.limit, len(val_ds)))) if args.limit else val_ds
 
     loader_kw = dict(num_workers=args.workers, pin_memory=device.type == "cuda", worker_init_fn=worker_init_fn)
@@ -130,6 +149,7 @@ def main(argv: list[str] | None = None) -> dict:
         with open(log_path, "a") as f:
             f.write(json.dumps(row) + "\n")
         print(json.dumps(row))
+        torch.save({"model": model.state_dict(), "epoch": epoch, "val": val}, args.out / "last.pt")
         if val["mae"] < best_mae:
             best_mae, best_epoch, bad = val["mae"], epoch, 0
             torch.save({"model": model.state_dict(), "epoch": epoch, "val": val}, args.out / "best.pt")
