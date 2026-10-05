@@ -28,26 +28,34 @@ def terms(pid) -> tuple[float, float, float]:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", type=Path, required=True)
+    p.add_argument("--model", type=Path, default=None)
     p.add_argument("--split", default="val")
     p.add_argument("--seeds", type=int, default=3)
+    p.add_argument("--dart-sigma", type=float, default=None, help="instead of the model, the expert drives with DART noise")
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
-    model = load_model(args.model)
-    env = make_env(args.split, camera=True, eval_mode=True)
+    from ads.sim.collect import ar1_innovation_std
+
+    model = load_model(args.model) if args.dart_sigma is None else None
+    env = make_env(args.split, camera=args.dart_sigma is None, eval_mode=True)
     out = {}
     for seed in list(config.SPLITS[args.split])[: args.seeds]:
         obs, _ = env.reset(seed=seed)
         expert = make_expert(env, seed)
+        rng, noise = np.random.default_rng(seed), 0.0
         rows = []
         for step in range(config.EPISODE_HORIZON):
             exp_steer, accel = expert_action(expert)
             h, lat_pid = terms(expert.heading_pid), terms(expert.lateral_pid)
             lateral, curvature = lane_state(env.agent)
             v = speed_kmh(env.agent)
-            pred = predict(model, camera_frame(obs), v)
+            if args.dart_sigma is None:
+                pred = predict(model, camera_frame(obs), v)  # the model always steers; no safety driver
+            else:  # data-collection conditions: expert steering plus AR(1) noise
+                noise = config.DART_RHO * noise + ar1_innovation_std(args.dart_sigma) * rng.standard_normal()
+                pred = float(np.clip(exp_steer + noise, -1, 1))
             rows.append([step, lateral, curvature, pred, exp_steer, *h, *lat_pid])
-            obs, _r, term, trunc, _info = env.step([pred, accel])  # the model always steers; no safety driver
+            obs, _r, term, trunc, _info = env.step([pred, accel])
             if term or trunc or abs(lateral) > 2.5:
                 break
         a = np.array(rows)
