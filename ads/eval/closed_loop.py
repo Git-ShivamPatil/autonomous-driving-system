@@ -55,10 +55,10 @@ def predict(model, frame: np.ndarray, speed_kmh: float) -> float:
         return float(model(x, torch.tensor([speed_kmh])).clamp(-1, 1).item())
 
 
-def _init_worker(model_path: str | None, camera: bool) -> None:
+def _init_worker(model_path: str | None, camera: bool, split: str) -> None:
     from ads.sim.env import make_env
 
-    _STATE["env"] = make_env("test", camera=camera, eval_mode=True)
+    _STATE["env"] = make_env(split, camera=camera, eval_mode=True)
     _STATE["model"] = load_model(Path(model_path)) if model_path else None
 
 
@@ -99,6 +99,8 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
     lateral_abs, segments, segment = [], [], []
     open_pairs = []  # (prediction, expert steering, curvature) on the visited states
     crash_flags, line_flags = [], []
+    takeover_events = []  # [step, lane curvature, speed km/h] at each intervention
+    curve_steps = 0
     distance, steps = 0.0, 0
     writer = None
     if video:
@@ -113,6 +115,7 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
         expert_steer, accel = expert_action(expert)
         lateral, curvature = lane_state(env.agent)
         v = speed_kmh(env.agent)
+        curve_steps += abs(curvature) > config.CURVE_CURVATURE
         pred = predict(model, camera_frame(obs), v) if model is not None else None
         driver_steer = expert_steer if driver == "expert" else pred
 
@@ -121,6 +124,7 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
             executed, in_control = expert_steer, False
         elif abs(lateral) > config.TAKEOVER_LATERAL_M:
             interventions += 1
+            takeover_events.append([step, round(curvature, 6), round(v, 2)])
             takeover_left = takeover_steps - 1
             executed, in_control = expert_steer, False
         else:
@@ -176,6 +180,8 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
     record = dict(result.__dict__)
     record["success"] = result.success
     record["open_pairs"] = [[round(a, 5), round(b, 5), round(c, 6)] for a, b, c in open_pairs]
+    record["takeover_events"] = takeover_events
+    record["curve_fraction"] = curve_steps / max(steps, 1)
     record["wall_seconds"] = time.perf_counter() - t0
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -192,6 +198,14 @@ def summarize_records(records: list[dict], driver: str) -> dict:
     fields = metrics.EpisodeResult.__dataclass_fields__
     episodes = [metrics.EpisodeResult(**{k: r[k] for k in fields}) for r in records]
     summary = metrics.summarize(episodes, dt=config.STEP_DT, penalty_s=config.NVIDIA_PENALTY_SECONDS)
+    # Interventions per km on curves vs straights; distance is split by the fraction of steps on curves.
+    events = [e for r in records for e in r.get("takeover_events", [])]
+    on_curve = sum(abs(c) > config.CURVE_CURVATURE for _, c, _ in events)
+    curve_km = sum(r["distance_m"] * r.get("curve_fraction", 0.0) for r in records) / 1000
+    straight_km = sum(r["distance_m"] for r in records) / 1000 - curve_km
+    if "curve_fraction" in records[0]:
+        summary["interventions_per_km_curve"] = on_curve / curve_km if curve_km > 0 else float("nan")
+        summary["interventions_per_km_straight"] = (len(events) - on_curve) / straight_km if straight_km > 0 else float("nan")
     pairs = [p for r in records for p in r.get("open_pairs", [])]
     if pairs:
         pred, target, curv = (np.array(x) for x in zip(*pairs, strict=True))
@@ -200,10 +214,11 @@ def summarize_records(records: list[dict], driver: str) -> dict:
     return summary
 
 
-def run_key(driver: str, model: Path | None) -> dict:
+def run_key(driver: str, model: Path | None, split: str = "test") -> dict:
     """Everything that determines an episode's result. Cached episodes are reused only under the same key."""
     return {
         "driver": driver,
+        "split": split,
         "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest() if model else None,
         "map_blocks": config.MAP_BLOCKS,
         "block_distribution": config.BLOCK_DISTRIBUTION,
@@ -221,15 +236,18 @@ def main(argv: list[str] | None = None) -> dict:
     p.add_argument("--model", type=Path, default=None)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--workers", type=int, default=1, help="MetaDrive processes; >1 was slower on a 2-core, 8 GB machine")
-    p.add_argument("--seeds", type=int, default=len(config.TEST_SEEDS), help="first N test seeds")
+    p.add_argument(
+        "--split", choices=["test", "val"], default="test", help="val roads are for choosing between models; test is final"
+    )
+    p.add_argument("--seeds", type=int, default=None, help="first N seeds of the split (default: all)")
     p.add_argument("--videos", type=int, default=0, help="record MP4s for the first N seeds")
     p.add_argument("--fresh", action="store_true", help="discard cached episodes in --out")
     args = p.parse_args(argv)
     if args.driver == "model" and args.model is None:
         p.error("--driver model needs --model")
 
-    seeds = list(config.TEST_SEEDS)[: args.seeds]
-    key, key_path = run_key(args.driver, args.model), args.out / "run.json"
+    seeds = list(config.SPLITS[args.split])[: args.seeds]
+    key, key_path = run_key(args.driver, args.model, args.split), args.out / "run.json"
     if args.fresh:
         shutil.rmtree(args.out / "episodes", ignore_errors=True)
     elif key_path.exists() and json.loads(key_path.read_text()) != key:
@@ -239,7 +257,7 @@ def main(argv: list[str] | None = None) -> dict:
     camera = args.model is not None or args.videos > 0
     t_start = time.perf_counter()
     records: dict[int, dict] = {}
-    initargs = (str(args.model) if args.model else None, camera)
+    initargs = (str(args.model) if args.model else None, camera, args.split)
     with keep_awake(), ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=initargs) as pool:
         pending, idx = set(), 0
         while idx < len(seeds) or pending:
@@ -262,6 +280,7 @@ def main(argv: list[str] | None = None) -> dict:
         "provenance": provenance.stamp("ads.eval.closed_loop"),
         "driver": args.driver,
         "model": str(args.model) if args.model else None,
+        "split": args.split,
         "seeds": [seeds[0], seeds[-1]],
         "wall_seconds": time.perf_counter() - t_start,
         **summarize_records(ordered, args.driver),

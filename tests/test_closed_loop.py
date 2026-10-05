@@ -9,6 +9,10 @@ def test_run_key_changes_with_the_checkpoint_bytes(tmp_path):
     assert run_key("model", a) == run_key("model", a)
 
 
+def test_run_key_separates_splits():
+    assert run_key("expert", None, "val") != run_key("expert", None, "test")
+
+
 def test_run_key_separates_drivers():
     assert run_key("expert", None) != run_key("model", None)
 
