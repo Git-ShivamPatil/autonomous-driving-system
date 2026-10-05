@@ -23,6 +23,20 @@ def test_read_index_parses_both_line_formats(tmp_path):
     assert angles.tolist() == [0.0, -12.5, np.float32(3.1)]
 
 
+def test_batched_augmentation_flips_labels_with_images():
+    import torch
+
+    x = torch.zeros(64, 3, 4, 6)
+    x[:, :, :, 0] = 200.0  # a bright left column
+    y = torch.linspace(-1, 1, 64)
+    gen = torch.Generator().manual_seed(0)
+    xa, ya = sully.augment_batch(x, y, gen)
+    flipped = xa[:, 1, 0, -1] > 0  # chroma is untouched by brightness, so the column marks a flip
+    assert flipped.any() and (~flipped).any()
+    assert torch.allclose(ya[flipped], -y[flipped]) and torch.allclose(ya[~flipped], y[~flipped])
+    assert (xa[:, 0] <= 255).all()
+
+
 def test_scores():
     s = sully.scores(np.array([1.0, 2.0, 3.0]), np.array([1.0, 2.0, 5.0]))
     assert s["mae_deg"] == 2 / 3

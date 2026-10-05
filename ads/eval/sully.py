@@ -98,30 +98,43 @@ def scores(pred_deg: np.ndarray, true_deg: np.ndarray) -> dict:
     }
 
 
-def finetune(model, images, targets, device, epochs: int, lr: float, seed: int = 0):
+def augment_batch(x, y, gen):
+    """Batched, on-device augmentation: luma brightness in [0.6, 1.4] and horizontal flip with negated label.
+
+    x is (N, 3, H, W) float YUV in [0, 255]; the per-image OpenCV augmentation of the simulator recipe is
+    too slow for the 2-core CPU here, so the two cheapest of its four operations are done on the GPU.
+    """
+    import torch
+
+    n = x.shape[0]
+    gain = torch.empty(n, device=x.device).uniform_(0.6, 1.4, generator=gen).view(n, 1, 1)
+    x = x.clone()
+    x[:, 0] = (x[:, 0] * gain).clamp(0, 255)
+    flip = torch.rand(n, device=x.device, generator=gen) < 0.5
+    x = torch.where(flip.view(n, 1, 1, 1), x.flip(-1), x)
+    return x, torch.where(flip, -y, y)
+
+
+def finetune(model, images, targets, device, epochs: int, lr: float, seed: int = 0, batch: int = 256):
     """Train on (images, angle / LABEL_SCALE_DEG) with the steering recipe's loss and optimiser."""
     import torch
     from torch.nn import functional as F
 
-    from ads.steering.preprocess import augment
-
     torch.manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(seed)
     rng = np.random.default_rng(seed)
+    images = np.asarray(images)  # the fitting part fits in memory (~0.9 GB)
+    targets = torch.from_numpy(np.asarray(targets, dtype=np.float32))
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    steps = epochs * (len(images) // 256)
+    steps = epochs * (len(images) // batch)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(steps, 1))
     model.train()
     for _ in range(epochs):
         order = rng.permutation(len(images))
-        for b in range(0, len(order) - 255, 256):
-            idx = np.sort(order[b : b + 256])
-            imgs, ys = [], []
-            for i in idx:
-                img, y = augment(np.asarray(images[i]), float(targets[i]), rng)
-                imgs.append(img)
-                ys.append(y)
-            x = torch.from_numpy(np.stack(imgs).transpose(0, 3, 1, 2)).to(device)
-            y = torch.tensor(ys, device=device)
+        for b in range(0, len(order) - batch + 1, batch):
+            idx = np.sort(order[b : b + batch])
+            x = torch.from_numpy(images[idx].transpose(0, 3, 1, 2)).to(device).float()
+            x, y = augment_batch(x, targets[idx].to(device), gen)
             s = torch.full((len(idx),), SPEED_KMH, device=device)
             loss = F.smooth_l1_loss(model(x, s), y, beta=0.1)
             opt.zero_grad(set_to_none=True)
