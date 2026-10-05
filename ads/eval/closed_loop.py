@@ -55,9 +55,10 @@ def predict(model, frame: np.ndarray, speed_kmh: float) -> float:
         return float(model(x, torch.tensor([speed_kmh])).clamp(-1, 1).item())
 
 
-def _init_worker(model_path: str | None, camera: bool, split: str) -> None:
+def _init_worker(model_path: str | None, camera: bool, split: str, smooth: float = 1.0) -> None:
     from ads.sim.env import make_env
 
+    _STATE["smooth"] = smooth
     _STATE["env"] = make_env(split, camera=camera, eval_mode=True)
     _STATE["model"] = load_model(Path(model_path)) if model_path else None
 
@@ -90,7 +91,8 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
     if path.exists():
         return json.loads(path.read_text())
 
-    env, model = _STATE["env"], _STATE["model"]
+    env, model, smooth = _STATE["env"], _STATE["model"], _STATE["smooth"]
+    last_executed = 0.0
     t0 = time.perf_counter()
     obs, info = env.reset(seed=seed)
     expert = make_expert(env, seed)
@@ -120,6 +122,8 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
         curve_steps += abs(curvature) > config.CURVE_CURVATURE
         pred = predict(model, camera_frame(obs), v) if model is not None else None
         driver_steer = expert_steer if driver == "expert" else pred
+        if driver == "model" and smooth < 1.0:  # exponential smoothing of the model's command
+            driver_steer = smooth * pred + (1.0 - smooth) * last_executed
 
         if takeover_left > 0:
             takeover_left -= 1
@@ -131,6 +135,7 @@ def run_episode(seed: int, driver: str, out: Path, video: bool) -> dict:
             executed, in_control = expert_steer, False
         else:
             executed, in_control = driver_steer, True
+        last_executed = executed
 
         # Open-loop pairs (expert driver) use every state; on-policy pairs (model driver) only the states
         # the model itself reached, not the safety driver's recoveries.
@@ -216,7 +221,7 @@ def summarize_records(records: list[dict], driver: str) -> dict:
     return summary
 
 
-def run_key(driver: str, model: Path | None, split: str = "test") -> dict:
+def run_key(driver: str, model: Path | None, split: str = "test", smooth: float = 1.0) -> dict:
     """Everything that determines an episode's result. Cached episodes are reused only under the same key."""
     return {
         "driver": driver,
@@ -230,6 +235,7 @@ def run_key(driver: str, model: Path | None, split: str = "test") -> dict:
         "takeover_seconds": config.TAKEOVER_SECONDS,
         "camera_channel_order": config.CAMERA_CHANNEL_ORDER,
         "expert_integral_reset_while_model_steers": True,
+        "smooth": smooth,
     }
 
 
@@ -245,12 +251,16 @@ def main(argv: list[str] | None = None) -> dict:
     p.add_argument("--seeds", type=int, default=None, help="first N seeds of the split (default: all)")
     p.add_argument("--videos", type=int, default=0, help="record MP4s for the first N seeds")
     p.add_argument("--fresh", action="store_true", help="discard cached episodes in --out")
+    p.add_argument("--smooth", type=float, default=1.0, help="model steering = a*prediction + (1-a)*previous command; 1 = off")
     args = p.parse_args(argv)
     if args.driver == "model" and args.model is None:
         p.error("--driver model needs --model")
+    if not 0.0 < args.smooth <= 1.0:
+        p.error("--smooth must be in (0, 1]")
+    stamp = provenance.stamp("ads.eval.closed_loop")  # at the start: the code that runs is the code recorded
 
     seeds = list(config.SPLITS[args.split])[: args.seeds]
-    key, key_path = run_key(args.driver, args.model, args.split), args.out / "run.json"
+    key, key_path = run_key(args.driver, args.model, args.split, args.smooth), args.out / "run.json"
     if args.fresh:
         shutil.rmtree(args.out / "episodes", ignore_errors=True)
     elif key_path.exists() and json.loads(key_path.read_text()) != key:
@@ -260,7 +270,7 @@ def main(argv: list[str] | None = None) -> dict:
     camera = args.model is not None or args.videos > 0
     t_start = time.perf_counter()
     records: dict[int, dict] = {}
-    initargs = (str(args.model) if args.model else None, camera, args.split)
+    initargs = (str(args.model) if args.model else None, camera, args.split, args.smooth)
     with keep_awake(), ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker, initargs=initargs) as pool:
         pending, idx = set(), 0
         while idx < len(seeds) or pending:
@@ -280,9 +290,10 @@ def main(argv: list[str] | None = None) -> dict:
 
     ordered = [records[s] for s in seeds]
     summary = {
-        "provenance": provenance.stamp("ads.eval.closed_loop"),
+        "provenance": stamp,
         "driver": args.driver,
         "model": str(args.model) if args.model else None,
+        "smooth": args.smooth,
         "split": args.split,
         "seeds": [seeds[0], seeds[-1]],
         "wall_seconds": time.perf_counter() - t_start,
